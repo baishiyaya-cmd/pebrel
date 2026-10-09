@@ -1,16 +1,18 @@
 //! Resource sidebar owns polling and presentation; collectors never borrow UI entities.
+mod charts;
 mod disks;
 mod overview;
 mod presentation;
+mod processes;
 
 use crate::resource_monitor::{Collector, Probe, Ranking, Request, Snapshot, Target};
-use gpui::{AppContext as _, Context, IntoElement, Render, Task, Window};
-use std::collections::HashSet;
+use gpui::{AppContext as _, Context, Entity, IntoElement, Render, Task, Window};
+use std::collections::{HashSet, VecDeque};
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Focused execution scope; a disconnected SSH pane has identity but no executable target.
 #[derive(Clone)]
@@ -28,6 +30,28 @@ pub(crate) struct Scope {
 enum Category {
     Overview,
     Docker,
+}
+
+/// A real network sample retained for the overview's recent-traffic graph.
+struct TrafficSample {
+    /// Sampling completion time used for the shared 60-second horizontal axis.
+    sampled: Instant,
+    /// Transmitted bytes per second; unavailable samples produce a gap.
+    upload: Option<f64>,
+    /// Received bytes per second; unavailable samples produce a gap.
+    download: Option<f64>,
+}
+
+/// CPU components belong to the same host interval and retain unavailable measurements.
+struct CpuSample {
+    /// Completion time for the graph's elapsed-time axis.
+    sampled: Instant,
+    /// Whole-host utilization in percent.
+    total: Option<f32>,
+    /// User-mode utilization in percent.
+    user: Option<f32>,
+    /// System-mode utilization in percent.
+    system: Option<f32>,
 }
 
 /// One workspace-owned sidebar, shared across panes targeting the same host.
@@ -48,8 +72,18 @@ pub(crate) struct ResourceMonitor {
     snapshot: Option<Snapshot>,
     /// Current collection failure; absence does not imply a sample exists.
     error: Option<String>,
+    /// Real CPU samples from at most the previous minute.
+    history: VecDeque<CpuSample>,
+    /// Actual interface traffic history; reset with the host or interface selection.
+    network_history: VecDeque<TrafficSample>,
+    /// Persistent chart entities own pointer state across telemetry refreshes.
+    cpu_chart: Entity<charts::TrendChart>,
+    /// Network chart pointer state is independent of CPU inspection.
+    network_chart: Entity<charts::TrendChart>,
     /// Additional data mounts are collapsed when entering a host.
     other_disks_expanded: bool,
+    /// Current modal demand; replacing the token prevents old dialogs affecting a new host.
+    details: Arc<AtomicBool>,
     /// Stable container IDs whose port rows are expanded; empty by default.
     expanded: HashSet<String>,
     /// Owns timer and worker completion subscriptions; dropped on hide or scope change.
@@ -76,7 +110,7 @@ impl ResourceMonitor {
     }
 
     /// Create a dormant sidebar; no OS or network work happens during construction.
-    pub(crate) fn new(_cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(cx: &mut Context<Self>) -> Self {
         let scope = Scope { key: "local".into(), label: "".into(), target: Some(Target::Native) };
         Self {
             focused: scope.clone(),
@@ -87,7 +121,12 @@ impl ResourceMonitor {
             category: Category::Overview,
             snapshot: None,
             error: None,
+            history: VecDeque::new(),
+            network_history: VecDeque::new(),
+            cpu_chart: cx.new(charts::TrendChart::new),
+            network_chart: cx.new(charts::TrendChart::new),
             other_disks_expanded: false,
+            details: Arc::new(AtomicBool::new(false)),
             expanded: HashSet::new(),
             polling: None,
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -116,7 +155,13 @@ impl ResourceMonitor {
             if changed {
                 self.snapshot = None;
                 self.error = None;
+                self.history.clear();
+                self.network_history.clear();
                 self.other_disks_expanded = false;
+                self.cpu_chart.update(cx, |chart, cx| chart.clear(cx));
+                self.network_chart.update(cx, |chart, cx| chart.clear(cx));
+                self.details.store(false, Ordering::Relaxed);
+                self.details = Arc::new(AtomicBool::new(false));
                 self.expanded.clear();
             }
             self.scope = scope;
@@ -149,7 +194,7 @@ impl ResourceMonitor {
             loop {
                 let request = match this.update(cx, |view, _| Request {
                     docker: view.category == Category::Docker,
-                    processes: false,
+                    processes: view.details.load(Ordering::Relaxed),
                 }) {
                     Ok(request) => request,
                     Err(_) => break,
@@ -174,6 +219,40 @@ impl ResourceMonitor {
                         }
                         match result {
                             Ok(snapshot) => {
+                                if let Some(network) = &snapshot.summary.network {
+                                    let previous = view
+                                        .snapshot
+                                        .as_ref()
+                                        .and_then(|sample| sample.summary.network.as_ref());
+                                    if previous
+                                        .is_some_and(|old| old.interfaces != network.interfaces)
+                                    {
+                                        view.network_history.clear();
+                                    }
+                                    view.network_history.push_back(TrafficSample {
+                                        sampled: snapshot.sampled,
+                                        upload: network.transmit_rate,
+                                        download: network.receive_rate,
+                                    });
+                                } else {
+                                    view.network_history.clear();
+                                }
+                                while view.network_history.front().is_some_and(|sample| {
+                                    sample.sampled.elapsed() > Duration::from_secs(60)
+                                }) {
+                                    view.network_history.pop_front();
+                                }
+                                view.history.push_back(CpuSample {
+                                    sampled: snapshot.sampled,
+                                    total: snapshot.cpu,
+                                    user: snapshot.summary.cpu_user,
+                                    system: snapshot.summary.cpu_system,
+                                });
+                                while view.history.front().is_some_and(|sample| {
+                                    sample.sampled.elapsed() > Duration::from_secs(60)
+                                }) {
+                                    view.history.pop_front();
+                                }
                                 if let Probe::Ready(docker) = &snapshot.docker {
                                     view.expanded.retain(|id| {
                                         docker.containers.iter().any(|item| &item.id == id)

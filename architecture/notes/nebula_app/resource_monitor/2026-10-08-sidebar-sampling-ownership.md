@@ -1,43 +1,153 @@
-# 资源采集的类型与所有权
+# Resource sidebar sampling ownership
 
 ## Status
 
-待审阅；本机与 SSH/WSL 采集及基础资源侧栏已实现。编译、实际界面和运行验证尚未执行。
+Implemented; build, test execution and runtime acceptance remain unverified.
 
 ## Context
 
-资源监控需要明确区分未采集、不支持、失败和真实零值。系统计数器和可选设备命令具有不同的失败边界，不能让 Docker 或驱动错误使 CPU、内存快照失效。
+The terminal workspace can contain native, WSL and SSH panes at the same time.
+Resource measurements need an explicit host identity and must not block rendering,
+write commands into terminal input, or continue polling after the sidebar closes.
+Optional GPU and Docker tools can fail independently of CPU and memory collection.
 
 ## Evidence
 
-项目使用类型化应用能力，由 GPUI 消费准备好的数据。本机系统指标使用已有依赖图中的 sysinfo 0.31.4；设备命令复用 platform/process_output 的有界、可取消读取器。
+- [Workspace binding](../../../../nebula_app/src/gpui_shell/workspace/details_panel.rs)
+  captures the focused pane's execution context and SSH readiness.
+- [Sidebar ownership](../../../../nebula_app/src/gpui_shell/resource_monitor.rs)
+  owns the polling task, cancellation token and last completed snapshot.
+- [Collector](../../../../nebula_app/src/resource_monitor.rs) produces typed snapshots;
+  native sampling uses the sysinfo 0.31.4 version already present in the dependency graph.
+- [Guest adapter](../../../../nebula_app/src/resource_monitor/guest.rs) reuses authenticated
+  SSH channels and the existing frozen WSL command context.
+- [Guest transport](../../../../nebula_app/src/resource_monitor/guest/transport.rs)
+  discovers Linux/macOS through uname and Windows through its native PowerShell environment.
+- Windows process units and creation identity follow [Win32_Process](https://learn.microsoft.com/en-us/windows/win32/cimwin32prov/win32-process);
+  inverse CPU counters follow [WMI performance sampling](https://github.com/MicrosoftDocs/win32/blob/docs/desktop-src/WmiSdk/wmi-tasks--performance-monitoring.md).
+- [Boundary tests](../../../../nebula_app/src/resource_monitor/tests.rs) specify CPU
+  baseline, boot identity, PID reuse, Docker port semantics and missing-counter behavior.
 
 ## Decision
 
-采集序列拥有 CPU、进程和网络基线，输出不可变 Snapshot。所有系统扫描和设备命令由调用者置于后台工作器。设备查询共享取消令牌和总截止时间；Docker 仅在请求时采集。概览最多保留五个进程，详情请求可取得完整列表。
+The shared right sidebar owns a lazy resource view. One background collector performs
+one sample at a time, then waits two seconds. Hiding the panel, pausing it, changing its
+target or dropping the view cancels the owned task and signals bounded subprocess work.
+Late results are rejected before updating UI state. Failures retain the previous sample
+with an explicit stale indication; unavailable measurements are never displayed as zero.
 
-进程排序和磁盘主卷选择属于采集模块的共享规则。网络速率只在接口集合一致、累计计数器未回退时计算。工作区资源侧栏拥有唯一轮询序列；隐藏、暂停、切换目标或销毁视图时取消工作器。后台结果只有在主机身份和可见状态仍有效时才能更新快照。
+Native counters come from sysinfo, enabled with the GPUI product feature. Guest probes use system-provided tools without Python,
+an uploaded binary or a resident service. Linux reads /proc through sh and POSIX awk;
+macOS uses sysctl, vm_stat, top, ps and df; Windows uses PowerShell and local CIM providers.
+SSH connection generations, OS boot identities and process creation identities delimit deltas.
+Discovery is cached only within one connection generation. The Windows stdin bootstrap is
+UTF-16LE encoded for either OpenSSH default shell and emits UTF-8 responses; POSIX probes
+explicitly enter sh. Arguments are quoted as literals rather than interpolated as source.
 
-界面仅展示概览和 Docker 两页。概览使用当前指标和五个热点进程，不在渲染期间采集。系统盘优先，其他数据盘折叠，完整挂载快照通过只读弹窗查看；Docker 端口默认折叠。颜色遵循主题语义，不硬编码明暗配色。
+Guest JSON is converted into a typed counter snapshot before applying rates. Linux process
+ticks share the whole-host CPU clock; Windows uses 100ns process ticks; macOS uses cumulative
+ps milliseconds and elapsed sample time. macOS host CPU comes from an interval top sample.
+All process percentages represent a share of the host's entire logical CPU capacity.
 
-远程探测使用系统自带的 awk 或 PowerShell。SSH 复用已认证连接的独立执行通道，WSL 使用创建 pane 时捕获的发行版与用户上下文。连接代次、启动标识、进程创建时间和计数时钟共同约束速率基线；JSON 只存在于外部协议边界，进入业务流程前转换为具名类型。
+The sidebar has Overview and Docker tabs. NVIDIA telemetry uses nvidia-smi and exposes
+GPU cards within Overview only after a supported device is reported. Compute-process memory coverage is stated in the UI. Docker commands
+run only in the Docker category. The daemon endpoint remains visible because a context
+can target a different host; Docker CPU percentages use that daemon's logical CPU count.
+Container rows keep compact numeric columns and expand port mappings only on request.
+Docker statistics request full IDs and match inspection rows exactly. Missing Docker
+and empty inventories stop subsequent queries instead of probing unused statistics.
+Published bindings, unpublished exposed ports and stopped-container configurations have
+different presentation semantics. Port mappings make no network reachability claim.
 
 ## Rejected alternatives
 
-在视图渲染时扫描系统会阻塞界面；为每种展示单独实现排序和磁盘筛选会形成多份规则。以零代替缺失测量会混淆状态。
+- Terminal-input commands: interfere with interactive programs and terminal history.
+- OS/network queries during rendering: make slow hosts and tools block the UI thread.
+- Independent overlapping timers: permit stale host results and lose CPU delta ownership.
+- Inferring a host from cwd text: cannot distinguish a native path from a guest scope.
+- Installing a remote daemon: adds deployment and authentication responsibilities to a viewer.
+- Requiring Python: excludes otherwise supported SSH hosts with only OS-provided tools.
+- A single command for every OS: hides different counter units and native inspection interfaces.
+- Fabricating unsupported counters: obscures permissions and platform coverage.
+- Categorical line charts: the dependency's point scale and mandatory numeric values
+  do not preserve elapsed-time spacing and missing-value gaps in the resource history.
 
 ## Consequences
 
-GPU 使用 nvidia-smi，当前只支持 NVIDIA。磁盘指标表示文件系统容量，不表示 SMART 健康。原生缓存及用户态、系统态 CPU 分量不可用时保留缺失值。远程 macOS 和 Windows 的网络及逐核 CPU 指标暂不可用。
+The view has no persistence and performs read-only probes. Closing it cancels collection;
+reopening it starts fresh CPU baselines. Native sysinfo calls themselves are not preemptible.
+Local command owners reap cancelled children; SSH cancellation closes the owned channel.
+The client bounds each command's waiting time and response size; remote process termination
+after channel closure is controlled by the SSH server. Refresh cadence includes query time.
+GPU support currently covers NVIDIA only. Protected processes can lack counters. Disk status
+means filesystem capacity, not SMART health. macOS reports active, wired and compressed memory;
+its ps creation identity has second precision and its sample clock uses wall time. Backward clock
+changes invalidate deltas. macOS process I/O is unavailable; Windows process I/O includes non-disk
+activity. I/O coverage is explained in the UI; missing measurements are not represented as zero.
+Overview returns only the five highest CPU consumers. Ranking still scans lightweight
+process CPU counters: native sysinfo preserves its baseline, while Linux/macOS/Windows
+remote overview probes compare counters inside one bounded invocation. Linux reads
+resident memory only for selected overview PIDs. Overview omits per-process I/O and
+NVIDIA compute-process queries; guest overview output is bounded to five rows.
+
+The read-only process dialog owns a detail-demand token and input/sidebar subscriptions.
+The existing collector includes full process responses only while that token is active;
+no additional collector or timer is created. Closing or pausing the modal releases demand
+for subsequent queries. A bounded query already in flight may finish. A host switch replaces
+the token, preventing an old modal from requesting details for another host even if focus
+returns to the original key before observer delivery. The dialog rejects overview-only
+responses and freezes on host/token changes. All collected detail rows remain searchable
+and ranked through a virtualized table. The dialog shares an immutable row collection
+with render callbacks and sorts indices instead of copying complete rows during each
+render. Collector and UI rankings use the same process comparison rule; sidebar and
+dialog freshness derive from one collector-status rule.
+
+Overview adds OS product/version, uptime, per-core CPU and interface-scoped network counters.
+Native network counters use sysinfo; Linux guests use /proc/net/dev, excluding loopback,
+docker0 and veth links. Interface topology changes or counter regressions invalidate rates.
+Aggregated interfaces can include tunnels or bridges, so totals are not a guarantee of
+external-link traffic. Windows/macOS guest overview currently leaves network/per-core
+metrics unavailable; native hosts have sysinfo core and network metrics. Linux guest memory
+breaks down used, free and buffer/cache bytes; other adapters retain their existing memory
+accounting without inventing a cache estimate. Linux and macOS guest CPU samples expose
+user/system shares from the same interval as their total. Native sysinfo and Windows
+currently expose total CPU only; their missing component values remain unavailable.
+
+Disk overview selects the target-reported system mount: `/` on Unix and the sampled
+Windows OS's system drive. Boot, kernel, temporary and OS-internal mounts stay out of
+the compact overview. Other data mounts are collapsed initially. Linux mountinfo supplies
+volume identity and filesystem-relative roots, so only proven identical mounts are
+deduplicated; different subvolumes and unknown identities remain distinct. The complete
+inventory remains available in a read-only dialog pinned to the opening host's immutable
+snapshot. Native adapters without mount-root metadata retain uncertain duplicates.
+Disk rows expose filesystem type where available; disk I/O rates and SMART health are
+not collected.
+
+Charts and card surfaces resolve the current theme's semantic/chart palette on render,
+including light, dark and custom appearances. Category labels remain visible alongside
+colored markers. Persistent CPU/network chart entities own pointer state and cached
+paint bounds on the UI thread, sharing immutable series across pointer repaints. Hover selects the nearest actual sample and paints a
+crosshair with a window-clamped popover; missing counters remain `—`. Parent refreshes
+replace chart data without creating timers. Host changes clear inspection state.
+No fixed black/green palette or bitmap chart assets are used.
+Guest collection limits are 16,384 processes,
+256 containers, an eight-second system query budget and a separate eight-second optional-tool
+budget. Individual optional queries wait at most three seconds. Initial discovery adds at most
+five seconds. Required system commands, a usable shell and inspection permissions remain necessary.
 
 ## Validation
 
-提供进程排序、网络基线、Docker 查询范围、端口语义、GPU 缺失值、提前取消以及三类远程系统计数时钟、重启、PID 复用等测试。仅执行格式化、差异空白、翻译契约、脚本解析及架构静态检查；尚未执行编译、Rust 测试、窗口外观及交互、SSH/WSL 或设备集成验证。
+Rust formatting, PowerShell parsing, POSIX awk syntax and translation key checks passed.
+Awk parsing uses an initial unconditional exit and does not execute inspection commands.
+The repository architecture checker passed during implementation.
+Behavioral tests are supplied but have not been executed. No build, native UI acceptance,
+real GPU/Docker validation, or SSH/WSL integration run has been performed.
 
 ## Supersedes
 
-None。
+None.
 
 ## Revisit when
 
-引入其他设备提供者、改变系统计数器或将采集转移到其他进程时，重新核验所有权和指标语义。
+Additional GPU vendors, other SSH operating systems, persistent history or container control
+operations are required; or measured probe costs warrant category-specific sampling.

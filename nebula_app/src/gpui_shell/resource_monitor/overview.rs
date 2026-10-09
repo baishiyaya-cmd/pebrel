@@ -1,15 +1,27 @@
 //! Overview contains compact resource cards; detailed process inspection is explicitly requested.
+use super::charts::{ChartPoint, ChartSeries, MemorySlice, core_track, legend, memory_ring, trend};
 use super::presentation::{
     card, card_heading, optional_bytes, optional_rate, percent, process_row, progress, table_header,
 };
+use super::processes::ProcessDialog;
 use super::*;
 use crate::gpui_shell::prelude::*;
 use crate::i18n::{Message, UiLanguage};
 use crate::resource_monitor::bytes;
-use gpui::{Div, ParentElement as _, Styled as _, div, px};
+use gpui::{AppContext as _, Div, ParentElement as _, Styled as _, div, px};
+
+/// CPU series select a named component of each common sampling interval.
+enum CpuComponent {
+    /// Combined whole-host utilization.
+    Total,
+    /// Time executing user-mode work.
+    User,
+    /// Time executing kernel and interrupt work.
+    System,
+}
 
 impl ResourceMonitor {
-    /// Compose current host measurements with themed cards and a five-process preview.
+    /// Compose real host summaries with theme-aware charts and a five-process preview.
     pub(super) fn render_overview(
         &self,
         language: UiLanguage,
@@ -47,18 +59,50 @@ impl ResourceMonitor {
                 )
                 .child(card_heading(language.text(Message::MonitorUptime), uptime, cx)),
         );
-        let mut cpu = card(cx).child(section_heading(
-            IconName::Cpu,
-            language.text(Message::MonitorCpu),
-            percent(snapshot.cpu),
-            cx,
-        ));
+        let cpu_series = [
+            (Message::MonitorTotal, cx.theme().chart_3, CpuComponent::Total),
+            (Message::MonitorCpuUser, cx.theme().chart_1, CpuComponent::User),
+            (Message::MonitorCpuSystem, cx.theme().chart_2, CpuComponent::System),
+        ]
+        .into_iter()
+        .map(|(label, color, component)| ChartSeries {
+            color,
+            label: language.text(label).into(),
+            bytes_per_second: false,
+            points: self
+                .history
+                .iter()
+                .map(|sample| ChartPoint {
+                    sampled: sample.sampled,
+                    value: match component {
+                        CpuComponent::Total => sample.total,
+                        CpuComponent::User => sample.user,
+                        CpuComponent::System => sample.system,
+                    },
+                })
+                .collect(),
+        })
+        .collect();
+        let mut cpu = card(cx)
+            .child(section_heading(
+                IconName::Cpu,
+                language.text(Message::MonitorCpu),
+                percent(snapshot.cpu),
+                cx,
+            ))
+            .child(trend(&self.cpu_chart, cpu_series, 100.0, cx))
+            .child(
+                div()
+                    .text_size(px(10.0))
+                    .text_color(cx.theme().muted_foreground)
+                    .child(language.text(Message::MonitorTrend)),
+            );
         if summary.cpu_cores.is_empty() {
             cpu = cpu.child(
                 h_flex()
                     .gap_2()
                     .child(div().w(px(24.0)).child("CPU"))
-                    .child(div().flex_1().min_w_0().child(progress(snapshot.cpu, cx)))
+                    .child(div().flex_1().min_w_0().child(core_track(snapshot.cpu, cx)))
                     .child(div().w(px(44.0)).text_right().child(percent(snapshot.cpu))),
             );
         } else {
@@ -73,34 +117,55 @@ impl ResourceMonitor {
                                 .text_color(cx.theme().muted_foreground)
                                 .child(index.to_string()),
                         )
-                        .child(div().flex_1().min_w_0().child(progress(*usage, cx)))
+                        .child(div().flex_1().min_w_0().child(core_track(*usage, cx)))
                         .child(div().w(px(44.0)).text_right().child(percent(*usage))),
                 );
             }
         }
         body = body.child(cpu);
-        let mut memory = card(cx)
-            .child(section_heading(
-                IconName::MemoryStick,
-                language.text(Message::MonitorMemory),
-                bytes(snapshot.total_memory),
-                cx,
-            ))
-            .child(card_heading(language.text(Message::MonitorUsed), bytes(snapshot.memory), cx));
+        let mut slices = vec![MemorySlice { bytes: snapshot.memory, color: cx.theme().chart_1 }];
+        let mut categories = h_flex().flex_1().min_w_0().flex_wrap().gap_2().child(legend(
+            language.text(Message::MonitorUsed),
+            bytes(snapshot.memory),
+            cx.theme().chart_1,
+            cx,
+        ));
         if let Some(cache) = summary.cache {
-            memory =
-                memory.child(card_heading(language.text(Message::MonitorCache), bytes(cache), cx));
+            slices.push(MemorySlice { bytes: cache, color: cx.theme().chart_2 });
+            categories = categories.child(legend(
+                language.text(Message::MonitorCache),
+                bytes(cache),
+                cx.theme().chart_2,
+                cx,
+            ));
         }
-        memory = memory.child(card_heading(
+        slices.push(MemorySlice { bytes: summary.free, color: cx.theme().chart_3 });
+        categories = categories.child(legend(
             language.text(if summary.cache.is_some() {
                 Message::MonitorFree
             } else {
                 Message::MonitorAvailable
             }),
             bytes(summary.free),
+            cx.theme().chart_3,
             cx,
         ));
-        body = body.child(memory);
+        body = body.child(
+            card(cx)
+                .child(section_heading(
+                    IconName::MemoryStick,
+                    language.text(Message::MonitorMemory),
+                    bytes(snapshot.total_memory),
+                    cx,
+                ))
+                .child(
+                    h_flex()
+                        .items_start()
+                        .gap_3()
+                        .child(memory_ring(slices, snapshot.total_memory, cx))
+                        .child(categories),
+                ),
+        );
         let mut network = card(cx).child(section_heading(
             IconName::Network,
             language.text(Message::MonitorNetwork),
@@ -108,7 +173,40 @@ impl ResourceMonitor {
             cx,
         ));
         if let Some(traffic) = &summary.network {
+            let maximum = self
+                .network_history
+                .iter()
+                .flat_map(|sample| [sample.upload, sample.download])
+                .flatten()
+                .fold(1.0_f64, f64::max) as f32;
+            let upload = ChartSeries {
+                color: cx.theme().chart_1,
+                label: language.text(Message::MonitorUpload).into(),
+                bytes_per_second: true,
+                points: self
+                    .network_history
+                    .iter()
+                    .map(|sample| ChartPoint {
+                        sampled: sample.sampled,
+                        value: sample.upload.map(|rate| rate as f32),
+                    })
+                    .collect(),
+            };
+            let download = ChartSeries {
+                color: cx.theme().chart_2,
+                label: language.text(Message::MonitorDownload).into(),
+                bytes_per_second: true,
+                points: self
+                    .network_history
+                    .iter()
+                    .map(|sample| ChartPoint {
+                        sampled: sample.sampled,
+                        value: sample.download.map(|rate| rate as f32),
+                    })
+                    .collect(),
+            };
             network = network
+                .child(trend(&self.network_chart, vec![upload, download], maximum, cx))
                 .child(
                     h_flex()
                         .w_full()
@@ -188,7 +286,46 @@ impl ResourceMonitor {
         let mut processes = snapshot.processes.iter().collect::<Vec<_>>();
         processes.sort_by(|a, b| a.compare_usage(b, Ranking::Cpu));
         let mut preview = card(cx)
-            .child(div().font_semibold().child(language.text(Message::MonitorTopFiveProcesses)))
+            .child(
+                h_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .font_semibold()
+                            .child(language.text(Message::MonitorTopFiveProcesses)),
+                    )
+                    .child(
+                        Button::new("monitor-all-processes")
+                            .ghost()
+                            .small()
+                            .label(language.text(Message::MonitorViewAll))
+                            .on_click(cx.listener(|_, _, window, cx| {
+                                let monitor = cx.entity();
+                                // Defer until the monitor listener releases its mutable entity borrow.
+                                window.defer(cx, move |window, cx| {
+                                    let dialog =
+                                        cx.new(|cx| ProcessDialog::new(&monitor, window, cx));
+                                    window.open_dialog(cx, move |modal, window, cx| {
+                                        let language = crate::gpui_shell::config::ui_language(cx);
+                                        let width = (f32::from(window.viewport_size().width)
+                                            - 32.0)
+                                            .clamp(240.0, 960.0);
+                                        modal
+                                            .title(language.text(Message::MonitorAllProcesses))
+                                            .width(px(width))
+                                            .margin_top(px(32.0))
+                                            .max_h(window.viewport_size().height - px(64.0))
+                                            .content({
+                                                let dialog = dialog.clone();
+                                                move |content, _, _| content.child(dialog.clone())
+                                            })
+                                    });
+                                });
+                            })),
+                    ),
+            )
             .child(table_header(
                 language.text(Message::MonitorProcessName),
                 language.text(Message::MonitorCpu),
