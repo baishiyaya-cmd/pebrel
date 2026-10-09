@@ -1,7 +1,8 @@
-//! Read-only host snapshots; native APIs and device commands share typed results.
+//! Read-only host snapshots; native and authenticated guest probes share typed results.
 
 mod devices;
 pub(crate) mod filesystems;
+mod guest;
 #[cfg(test)]
 mod tests;
 
@@ -10,6 +11,8 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
+
+use crate::runtime_exec::PaneExecContext;
 
 /// A collection plan separates compact overview output from explicitly requested process details.
 #[derive(Clone, Copy)]
@@ -56,6 +59,17 @@ pub(crate) struct Network {
     pub receive_rate: Option<f64>,
     /// Transmitted bytes per second, absent until a comparable baseline exists.
     pub transmit_rate: Option<f64>,
+}
+
+/// Execution boundary captured from the focused terminal, never its interactive input.
+#[derive(Clone)]
+pub(crate) enum Target {
+    /// The desktop host's native OS APIs.
+    Native,
+    /// Frozen WSL distribution, user and environment from pane creation.
+    Wsl(PaneExecContext),
+    /// An already authenticated SSH destination; probes never initiate authentication.
+    Ssh(String),
 }
 
 /// Optional telemetry distinguishes missing tools, failures and deferred work from zero.
@@ -220,6 +234,8 @@ pub(crate) struct Snapshot {
 
 /// A single owned sampling sequence; moving it between workers preserves CPU baselines.
 pub(crate) struct Collector {
+    /// Captured execution boundary for the lifetime of this sequence.
+    target: Target,
     /// Native CPU/process baselines, allocated only on the worker.
     native: sysinfo::System,
     /// Native interface counters retained between refreshes.
@@ -228,22 +244,32 @@ pub(crate) struct Collector {
     network_previous: Option<Network>,
     /// Native network sampling time, independent of slower optional device queries.
     network_refreshed: Option<Instant>,
+    /// Previous guest cumulative counters, scoped to its connection generation.
+    previous: Option<guest::RawSample>,
     /// Native refresh timestamp; absent before the first sample.
     refreshed: Option<Instant>,
     /// Whether the previous native sample collected process I/O, delimiting valid I/O deltas.
     refreshed_details: bool,
+    /// Captured SSH generation prevents deltas across reconnections.
+    connection: Option<u64>,
+    /// Guest OS discovered on this connection generation, never inferred from the desktop OS.
+    guest_os: Option<guest::GuestOs>,
 }
 
 impl Collector {
     /// Allocate a host-specific sampling sequence on a background worker.
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(target: Target) -> Self {
         Self {
+            target,
             native: sysinfo::System::new(),
             networks: sysinfo::Networks::new(),
             network_previous: None,
             network_refreshed: None,
+            previous: None,
             refreshed: None,
             refreshed_details: false,
+            connection: None,
+            guest_os: None,
         }
     }
 
@@ -256,6 +282,9 @@ impl Collector {
     ) -> Result<Snapshot, String> {
         if cancel.load(Ordering::Relaxed) {
             return Err("cancelled".into());
+        }
+        if !matches!(self.target, Target::Native) {
+            return self.sample_guest(request, cancel);
         }
         self.native.refresh_cpu_usage();
         self.native.refresh_memory();
